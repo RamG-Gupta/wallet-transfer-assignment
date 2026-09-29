@@ -326,6 +326,88 @@ func TestConcurrentTransfersDoNotOverdraft(t *testing.T) {
 	}
 }
 
+func TestConcurrentDuplicateIdempotencyKeyIsExactlyOnce(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	createWallet(t, srv, "wallet_1", 100)
+	createWallet(t, srv, "wallet_2", 0)
+
+	const n = 16
+	payload := map[string]any{
+		"idempotencyKey": "dup-concurrent",
+		"fromWalletId":   "wallet_1",
+		"toWalletId":     "wallet_2",
+		"amount":         25,
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	ids := make([]string, n)
+	codes := make([]int, n)
+	ledgers := make([][]any, n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				codes[i] = -1
+				return
+			}
+			res, err := srv.Client().Post(srv.URL+"/transfers", "application/json", bytes.NewReader(raw))
+			if err != nil {
+				codes[i] = -1
+				return
+			}
+			var body map[string]any
+			b, _ := io.ReadAll(res.Body)
+			res.Body.Close()
+			_ = json.Unmarshal(b, &body)
+			codes[i] = res.StatusCode
+			if id, ok := body["id"].(string); ok {
+				ids[i] = id
+			}
+			if ledger, ok := body["ledger"].([]any); ok {
+				ledgers[i] = ledger
+			}
+		}()
+	}
+	wg.Wait()
+
+	var created, okReplay int
+	for i, c := range codes {
+		switch c {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+			okReplay++
+		default:
+			t.Fatalf("unexpected status %d at %d", c, i)
+		}
+	}
+	if created != 1 || okReplay != n-1 {
+		t.Fatalf("created=%d replay=%d codes=%v", created, okReplay, codes)
+	}
+	firstID := ids[0]
+	if firstID == "" {
+		t.Fatal("missing transfer id")
+	}
+	for i, id := range ids {
+		if id != firstID {
+			t.Fatalf("id mismatch at %d: %s vs %s", i, id, firstID)
+		}
+		if len(ledgers[i]) != 2 {
+			t.Fatalf("ledger at %d: %v", i, ledgers[i])
+		}
+	}
+	if getBalance(t, srv, "wallet_1") != 75 {
+		t.Fatalf("source should move once")
+	}
+	if getBalance(t, srv, "wallet_2") != 25 {
+		t.Fatalf("destination should move once")
+	}
+}
+
 func TestHealth(t *testing.T) {
 	srv := newTestServer(t)
 	defer srv.Close()

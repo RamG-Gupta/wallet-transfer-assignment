@@ -85,7 +85,7 @@ func (s *Store) RunTransfer(
 	}
 	defer func() { _ = conn.Close() }()
 
-	if err := beginImmediate(ctx, conn); err != nil {
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
 		return domain.Transfer{}, false, err
 	}
 	committed := false
@@ -305,33 +305,6 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
-}
-
-func beginImmediate(ctx context.Context, conn *sql.Conn) error {
-	var err error
-	for i := 0; i < 80; i++ {
-		_, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`)
-		if err == nil {
-			return nil
-		}
-		if !isBusy(err) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	return err
-}
-
-func isBusy(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "busy") || strings.Contains(msg, "locked")
 }
 
 func isUnique(err error) bool {
