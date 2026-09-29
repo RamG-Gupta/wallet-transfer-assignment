@@ -3,6 +3,8 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -133,6 +135,13 @@ func decodeJSON(r *http.Request, dest any) error {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dest); err != nil {
 		return err
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("request body must contain a single JSON value")
+		}
+		return fmt.Errorf("trailing data after JSON value: %w", err)
 	}
 	return nil
 }

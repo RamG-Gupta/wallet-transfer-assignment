@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -99,16 +100,28 @@ func TestTransferMovesBalancesAndWritesLedger(t *testing.T) {
 	if body["status"] != "PROCESSED" {
 		t.Fatalf("status: %v", body["status"])
 	}
-	ledger, _ := body["ledger"].([]any)
-	if len(ledger) != 2 {
-		t.Fatalf("ledger len %d", len(ledger))
-	}
+	assertPersistedLedger(t, body, "wallet_1", "wallet_2", 100)
 	if getBalance(t, srv, "wallet_1") != 400 {
 		t.Fatalf("from balance")
 	}
 	if getBalance(t, srv, "wallet_2") != 150 {
 		t.Fatalf("to balance")
 	}
+
+	replay := postJSON(t, srv.Client(), srv.URL+"/transfers", map[string]any{
+		"idempotencyKey": "abc123",
+		"fromWalletId":   "wallet_1",
+		"toWalletId":     "wallet_2",
+		"amount":         100,
+	})
+	replayBody := readJSON(t, replay)
+	if replay.StatusCode != http.StatusOK {
+		t.Fatalf("replay status %d body %v", replay.StatusCode, replayBody)
+	}
+	if replayBody["id"] != body["id"] {
+		t.Fatalf("replay id")
+	}
+	assertPersistedLedger(t, replayBody, "wallet_1", "wallet_2", 100)
 }
 
 func TestIdempotentReplayReturnsOriginalTransfer(t *testing.T) {
@@ -324,4 +337,105 @@ func TestHealth(t *testing.T) {
 		t.Fatalf("status %d", res.StatusCode)
 	}
 	res.Body.Close()
+}
+
+func TestTrailingJSONIsRejected(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	raw := []byte(`{"id":"wallet_1","initialBalance":1}{"id":"wallet_2"}`)
+	res, err := srv.Client().Post(srv.URL+"/wallets", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readJSON(t, res)
+	if res.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d body %v", res.StatusCode, body)
+	}
+}
+
+func TestIdempotencyFingerprintDoesNotCollideOnNewlinesInWalletIDs(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	createWallet(t, srv, "a\nb", 50)
+	createWallet(t, srv, "c", 0)
+	createWallet(t, srv, "a", 50)
+	createWallet(t, srv, "b\nc", 0)
+
+	first := postJSON(t, srv.Client(), srv.URL+"/transfers", map[string]any{
+		"idempotencyKey": "newline-key",
+		"fromWalletId":   "a\nb",
+		"toWalletId":     "c",
+		"amount":         1,
+	})
+	firstBody := readJSON(t, first)
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("first status %d body %v", first.StatusCode, firstBody)
+	}
+
+	second := postJSON(t, srv.Client(), srv.URL+"/transfers", map[string]any{
+		"idempotencyKey": "newline-key",
+		"fromWalletId":   "a",
+		"toWalletId":     "b\nc",
+		"amount":         1,
+	})
+	secondBody := readJSON(t, second)
+	if second.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 for distinct payloads, got %d %v", second.StatusCode, secondBody)
+	}
+}
+
+func TestCreditOverflowFailsWithoutMovingFunds(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	createWallet(t, srv, "wallet_1", 1)
+	createWalletRaw(t, srv, fmt.Sprintf(`{"id":"wallet_2","initialBalance":%d}`, int64(math.MaxInt64)))
+
+	res := postJSON(t, srv.Client(), srv.URL+"/transfers", map[string]any{
+		"idempotencyKey": "overflow",
+		"fromWalletId":   "wallet_1",
+		"toWalletId":     "wallet_2",
+		"amount":         1,
+	})
+	body := readJSON(t, res)
+	if res.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d body %v", res.StatusCode, body)
+	}
+	if body["status"] != "FAILED" || body["failureReason"] != "BALANCE_OVERFLOW" {
+		t.Fatalf("overflow result %v", body)
+	}
+	ledger, _ := body["ledger"].([]any)
+	if len(ledger) != 0 {
+		t.Fatalf("ledger on overflow: %v", ledger)
+	}
+	if getBalance(t, srv, "wallet_1") != 1 {
+		t.Fatal("source changed")
+	}
+}
+
+func createWalletRaw(t *testing.T, srv *httptest.Server, raw string) {
+	t.Helper()
+	res, err := srv.Client().Post(srv.URL+"/wallets", "application/json", bytes.NewReader([]byte(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusCreated {
+		t.Fatalf("create wallet: %d %v", res.StatusCode, readJSON(t, res))
+	}
+	res.Body.Close()
+}
+
+func assertPersistedLedger(t *testing.T, body map[string]any, fromID, toID string, amount int64) {
+	t.Helper()
+	ledger, _ := body["ledger"].([]any)
+	if len(ledger) != 2 {
+		t.Fatalf("ledger len %d body %v", len(ledger), body)
+	}
+	debit, _ := ledger[0].(map[string]any)
+	credit, _ := ledger[1].(map[string]any)
+	if debit["walletId"] != fromID || debit["type"] != "DEBIT" || int64(debit["amount"].(float64)) != amount {
+		t.Fatalf("debit %v", debit)
+	}
+	if credit["walletId"] != toID || credit["type"] != "CREDIT" || int64(credit["amount"].(float64)) != amount {
+		t.Fatalf("credit %v", credit)
+	}
 }

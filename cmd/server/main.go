@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/RamG-Gupta/wallet-transfer-assignment/internal/httpapi"
 	"github.com/RamG-Gupta/wallet-transfer-assignment/internal/service"
@@ -31,7 +32,15 @@ func main() {
 		addr = ":8080"
 	}
 	log.Info("listening", "addr", addr)
-	if err := http.ListenAndServe(addr, srv.Routes()); err != nil {
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           srv.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := httpSrv.ListenAndServe(); err != nil {
 		log.Error("server stopped", "err", err)
 		os.Exit(1)
 	}

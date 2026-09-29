@@ -21,7 +21,10 @@ const (
 	EntryCredit EntryType = "CREDIT"
 )
 
-const FailureInsufficientFunds = "INSUFFICIENT_FUNDS"
+const (
+	FailureInsufficientFunds = "INSUFFICIENT_FUNDS"
+	FailureBalanceOverflow   = "BALANCE_OVERFLOW"
+)
 
 var (
 	ErrValidation        = errors.New("validation error")

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
 	"time"
 
@@ -123,6 +124,14 @@ func (s *Service) executeTransfer(tx *store.Tx, req domain.CreateTransferRequest
 		}
 		return tr, nil
 	}
+	if to.Balance > math.MaxInt64-req.Amount {
+		tr.Status = domain.StatusFailed
+		tr.FailureReason = domain.FailureBalanceOverflow
+		if err := tx.InsertTransfer(tr); err != nil {
+			return domain.Transfer{}, err
+		}
+		return tr, nil
+	}
 
 	if err := tx.InsertTransfer(tr); err != nil {
 		return domain.Transfer{}, err
@@ -152,6 +161,7 @@ func (s *Service) executeTransfer(tx *store.Tx, req domain.CreateTransferRequest
 }
 
 func requestHash(req domain.CreateTransferRequest) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\n%s\n%d", req.FromWalletID, req.ToWalletID, req.Amount)))
+	// %q quotes wallet IDs so newlines (or other bytes) cannot collide across fields.
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%q\n%q\n%d", req.FromWalletID, req.ToWalletID, req.Amount)))
 	return hex.EncodeToString(sum[:])
 }
