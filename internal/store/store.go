@@ -71,13 +71,20 @@ func (s *Store) GetWallet(ctx context.Context, id string) (domain.Wallet, error)
 	))
 }
 
+// Attempt is the service-layer result of a claimed transfer.
+// Failure, when set, is persisted as a sticky API error (no transfer row).
+type Attempt struct {
+	Transfer domain.Transfer
+	Failure  *domain.IdempotentFailure
+}
+
 // RunTransfer claims the idempotency key inside BEGIN IMMEDIATE, then runs fn.
 // Replay is true when the key already completed with the same request hash.
 func (s *Store) RunTransfer(
 	ctx context.Context,
 	claimKey, requestHash string,
 	now time.Time,
-	fn func(tx *Tx) (domain.Transfer, error),
+	fn func(tx *Tx) (Attempt, error),
 ) (domain.Transfer, bool, error) {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -119,7 +126,10 @@ func (s *Store) RunTransfer(
 				return domain.Transfer{}, false, err
 			}
 			committed = true
-			return domain.Transfer{}, true, replayTerminal(existing.ErrorCode, existing.ErrorDetail)
+			return domain.Transfer{}, true, &domain.IdempotentFailure{
+				Code:    existing.ErrorCode,
+				Message: existing.ErrorDetail,
+			}
 		}
 		if existing.TransferID == "" {
 			return domain.Transfer{}, false, fmt.Errorf("incomplete idempotency record for key %s", claimKey)
@@ -136,18 +146,16 @@ func (s *Store) RunTransfer(
 		return tr, true, nil
 	}
 
-	tr, err := fn(tx)
+	attempt, err := fn(tx)
 	if err != nil {
-		fnErr := err
-		code, detail, ok := terminalError(fnErr)
-		if !ok {
-			return domain.Transfer{}, false, fnErr
-		}
+		return domain.Transfer{}, false, err
+	}
+	if attempt.Failure != nil {
 		if _, err := conn.ExecContext(ctx, `
 			UPDATE idempotency_records
 			SET status = 'COMPLETED', error_code = ?, error_detail = ?, updated_at = ?
 			WHERE key = ?`,
-			code, detail, now.UTC().Format(timeLayout), claimKey,
+			attempt.Failure.Code, attempt.Failure.Message, now.UTC().Format(timeLayout), claimKey,
 		); err != nil {
 			return domain.Transfer{}, false, err
 		}
@@ -155,8 +163,9 @@ func (s *Store) RunTransfer(
 			return domain.Transfer{}, false, err
 		}
 		committed = true
-		return domain.Transfer{}, false, fnErr
+		return domain.Transfer{}, false, attempt.Failure
 	}
+	tr := attempt.Transfer
 	tr.IdempotencyKey = claimKey
 
 	if _, err := conn.ExecContext(ctx, `
@@ -344,20 +353,4 @@ func isUnique(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
-}
-
-func terminalError(err error) (code, detail string, ok bool) {
-	if errors.Is(err, domain.ErrNotFound) {
-		return "NOT_FOUND", err.Error(), true
-	}
-	return "", "", false
-}
-
-func replayTerminal(code, detail string) error {
-	switch code {
-	case "NOT_FOUND":
-		return fmt.Errorf("%s: %w", detail, domain.ErrNotFound)
-	default:
-		return fmt.Errorf("stored idempotent error %s: %s", code, detail)
-	}
 }

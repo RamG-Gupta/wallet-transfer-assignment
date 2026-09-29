@@ -21,7 +21,7 @@ The service must remain correct under duplicate delivery, client retries, and pr
 | Same key, different payload | `409 Conflict`, no side effects |
 | Concurrent transfers from the same wallet | Serialised per wallet; never overdraft; ledger stays balanced |
 | Invalid input (missing key, amount ≤ 0, same wallet) | `400`, no idempotency row, no transfer |
-| Unknown wallet | `404`, no transfer |
+| Unknown wallet | `404`, no transfer; the key is stored so a later retry still returns that `404` |
 
 Amounts are integers in the smallest currency unit (for this assignment, whole units as given in the spec). Floating-point JSON amounts are rejected.
 
@@ -106,7 +106,7 @@ There is no out-of-band retry worker. Recovery is client retry plus a single ato
 - **Storage:** `idempotency_records.key` is the primary key (`TEXT`).
 - **Fingerprint:** SHA-256 of `fromWalletId|toWalletId|amount`. Stored as `request_hash`.
 - **Detection:** `INSERT` the claim at the start of the transfer transaction. A unique-constraint violation means this key already completed (or is visible after the other transaction committed).
-- **Original result:** `transfer_id` on the idempotency row is loaded and returned as JSON. HTTP status follows the original outcome (`200` + `PROCESSED`, or `422` + `FAILED`).
+The service returns a structured `IdempotentFailure` for unknown wallets. The store persists `error_code`/`error_detail` without interpreting domain sentinels. Replay returns the same error message.
 - **No duplicate side effects:** the unique insert is the first write in the transaction. A second request cannot insert a second transfer for that key.
 
 `PROCESSING` is written in the same uncommitted transaction as the transfer work and is only committed after `COMPLETED` + `transfer_id` are set. Callers never observe a durable `PROCESSING` row.
@@ -126,7 +126,7 @@ There is no out-of-band retry worker. Recovery is client retry plus a single ato
 
 ## Observability expectations
 
-- Structured logs (`slog`) on transfer start/finish with `idempotencyKey`, `transferId`, `status`, not full payloads beyond wallet ids and amount.
+- Structured logs (`slog`) for transfer start, successful finish, and failed attempts (`idempotencyKey`, wallet ids, amount, `replay`, `err` or `status`). Payloads beyond those fields are not logged.
 - `GET /health` for liveness.
 - Metrics and tracing are out of scope.
 
@@ -137,7 +137,7 @@ SQLite is used so `go test` and CI run without Postgres. The model is PostgreSQL
 - `wallets(id PK, balance NOT NULL CHECK >= 0, created_at)`
 - `transfers(id PK, from_wallet_id FK, to_wallet_id FK, amount CHECK > 0, status IN PENDING|PROCESSED|FAILED, failure_reason, created_at, updated_at)`
 - `ledger_entries(id PK, transfer_id FK, wallet_id FK, entry_type IN DEBIT|CREDIT, amount CHECK > 0, created_at)` unique `(transfer_id, entry_type)`
-- `idempotency_records(key PK, request_hash NOT NULL, transfer_id FK NULL, status, created_at, updated_at)`
+- `idempotency_records(key PK, request_hash NOT NULL, transfer_id FK NULL, error_code, error_detail, status, created_at, updated_at)` — a completed row has either `transfer_id` or a sticky `error_code` (unknown wallet), not both.
 
 Indexes: `ledger_entries(wallet_id)`, `ledger_entries(transfer_id)`, `transfers(from_wallet_id)`.
 

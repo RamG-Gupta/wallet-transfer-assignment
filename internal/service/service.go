@@ -66,12 +66,23 @@ func (s *Service) CreateTransfer(ctx context.Context, req domain.CreateTransferR
 	}
 	now := s.clock()
 	hash := requestHash(req)
+	s.log.Info("transfer started",
+		"idempotencyKey", req.IdempotencyKey,
+		"fromWalletId", req.FromWalletID,
+		"toWalletId", req.ToWalletID,
+		"amount", req.Amount,
+	)
 
-	tr, replay, err := s.store.RunTransfer(ctx, req.IdempotencyKey, hash, now, func(tx *store.Tx) (domain.Transfer, error) {
+	tr, replay, err := s.store.RunTransfer(ctx, req.IdempotencyKey, hash, now, func(tx *store.Tx) (store.Attempt, error) {
 		return s.executeTransfer(tx, req, now)
 	})
 	if err != nil {
-		return domain.Transfer{}, false, err
+		s.log.Info("transfer failed",
+			"idempotencyKey", req.IdempotencyKey,
+			"replay", replay,
+			"err", err,
+		)
+		return domain.Transfer{}, replay, err
 	}
 
 	s.log.Info("transfer finished",
@@ -84,7 +95,7 @@ func (s *Service) CreateTransfer(ctx context.Context, req domain.CreateTransferR
 	return tr, replay, nil
 }
 
-func (s *Service) executeTransfer(tx *store.Tx, req domain.CreateTransferRequest, now time.Time) (domain.Transfer, error) {
+func (s *Service) executeTransfer(tx *store.Tx, req domain.CreateTransferRequest, now time.Time) (store.Attempt, error) {
 	ids := []string{req.FromWalletID, req.ToWalletID}
 	sort.Strings(ids)
 
@@ -93,9 +104,9 @@ func (s *Service) executeTransfer(tx *store.Tx, req domain.CreateTransferRequest
 		w, err := tx.GetWallet(id)
 		if err != nil {
 			if errors.Is(err, domain.ErrNotFound) {
-				return domain.Transfer{}, fmt.Errorf("%w: wallet %s", domain.ErrNotFound, id)
+				return store.Attempt{Failure: domain.WalletNotFound(id)}, nil
 			}
-			return domain.Transfer{}, err
+			return store.Attempt{}, err
 		}
 		locked[id] = w
 	}
@@ -120,36 +131,36 @@ func (s *Service) executeTransfer(tx *store.Tx, req domain.CreateTransferRequest
 		tr.Status = domain.StatusFailed
 		tr.FailureReason = domain.FailureInsufficientFunds
 		if err := tx.InsertTransfer(tr); err != nil {
-			return domain.Transfer{}, err
+			return store.Attempt{}, err
 		}
-		return tr, nil
+		return store.Attempt{Transfer: tr}, nil
 	}
 	if to.Balance > math.MaxInt64-req.Amount {
 		tr.Status = domain.StatusFailed
 		tr.FailureReason = domain.FailureBalanceOverflow
 		if err := tx.InsertTransfer(tr); err != nil {
-			return domain.Transfer{}, err
+			return store.Attempt{}, err
 		}
-		return tr, nil
+		return store.Attempt{Transfer: tr}, nil
 	}
 
 	if err := tx.InsertTransfer(tr); err != nil {
-		return domain.Transfer{}, err
+		return store.Attempt{}, err
 	}
 	if err := tx.InsertLedger(id, from.ID, domain.EntryDebit, req.Amount, now); err != nil {
-		return domain.Transfer{}, err
+		return store.Attempt{}, err
 	}
 	if err := tx.InsertLedger(id, to.ID, domain.EntryCredit, req.Amount, now); err != nil {
-		return domain.Transfer{}, err
+		return store.Attempt{}, err
 	}
 	if err := tx.UpdateBalance(from.ID, from.Balance-req.Amount); err != nil {
-		return domain.Transfer{}, err
+		return store.Attempt{}, err
 	}
 	if err := tx.UpdateBalance(to.ID, to.Balance+req.Amount); err != nil {
-		return domain.Transfer{}, err
+		return store.Attempt{}, err
 	}
 	if err := tx.UpdateTransferStatus(id, domain.StatusProcessed, "", now); err != nil {
-		return domain.Transfer{}, err
+		return store.Attempt{}, err
 	}
 
 	tr.Status = domain.StatusProcessed
@@ -157,7 +168,7 @@ func (s *Service) executeTransfer(tx *store.Tx, req domain.CreateTransferRequest
 		{WalletID: from.ID, Type: domain.EntryDebit, Amount: req.Amount},
 		{WalletID: to.ID, Type: domain.EntryCredit, Amount: req.Amount},
 	}
-	return tr, nil
+	return store.Attempt{Transfer: tr}, nil
 }
 
 func requestHash(req domain.CreateTransferRequest) string {

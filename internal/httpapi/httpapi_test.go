@@ -20,15 +20,26 @@ import (
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	dir := t.TempDir()
-	dsn := "file:" + filepath.Join(dir, "test.db")
-	st, err := store.Open(dsn)
+	return newTestServerAt(t, filepath.Join(t.TempDir(), "test.db"))
+}
+
+func newTestServerAt(t *testing.T, dbPath string) *httptest.Server {
+	t.Helper()
+	srv, _ := openTestApp(t, dbPath, true)
+	return srv
+}
+
+func openTestApp(t *testing.T, dbPath string, closeOnCleanup bool) (*httptest.Server, *store.Store) {
+	t.Helper()
+	st, err := store.Open("file:" + dbPath)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	t.Cleanup(func() { _ = st.Close() })
+	if closeOnCleanup {
+		t.Cleanup(func() { _ = st.Close() })
+	}
 	svc := service.New(st, nil)
-	return httptest.NewServer(httpapi.New(svc).Routes())
+	return httptest.NewServer(httpapi.New(svc).Routes()), st
 }
 
 func postJSON(t *testing.T, client *http.Client, url string, body any) *http.Response {
@@ -257,16 +268,19 @@ func TestUnknownWallet(t *testing.T) {
 		"amount":         1,
 	}
 	res := postJSON(t, srv.Client(), srv.URL+"/transfers", payload)
+	firstBody := readJSON(t, res)
 	if res.StatusCode != http.StatusNotFound {
-		t.Fatalf("status %d", res.StatusCode)
+		t.Fatalf("status %d body %v", res.StatusCode, firstBody)
 	}
-	res.Body.Close()
 
 	createWallet(t, srv, "nope", 0)
 	retry := postJSON(t, srv.Client(), srv.URL+"/transfers", payload)
-	body := readJSON(t, retry)
+	retryBody := readJSON(t, retry)
 	if retry.StatusCode != http.StatusNotFound {
-		t.Fatalf("replay after wallet create should stay 404, got %d %v", retry.StatusCode, body)
+		t.Fatalf("replay after wallet create should stay 404, got %d %v", retry.StatusCode, retryBody)
+	}
+	if retryBody["error"] != firstBody["error"] {
+		t.Fatalf("replay error body %v want %v", retryBody["error"], firstBody["error"])
 	}
 	if getBalance(t, srv, "wallet_1") != 100 {
 		t.Fatal("sticky 404 must not transfer later")
@@ -417,6 +431,42 @@ func TestConcurrentDuplicateIdempotencyKeyIsExactlyOnce(t *testing.T) {
 	}
 	if getBalance(t, srv, "wallet_2") != 25 {
 		t.Fatalf("destination should move once")
+	}
+}
+
+func TestIdempotencySurvivesProcessRestart(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "restart.db")
+	srv, st := openTestApp(t, dbPath, false)
+	createWallet(t, srv, "wallet_1", 200)
+	createWallet(t, srv, "wallet_2", 0)
+	payload := map[string]any{
+		"idempotencyKey": "restart-key",
+		"fromWalletId":   "wallet_1",
+		"toWalletId":     "wallet_2",
+		"amount":         30,
+	}
+	first := postJSON(t, srv.Client(), srv.URL+"/transfers", payload)
+	firstBody := readJSON(t, first)
+	if first.StatusCode != http.StatusCreated {
+		t.Fatalf("status %d body %v", first.StatusCode, firstBody)
+	}
+	srv.Close()
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	srv2 := newTestServerAt(t, dbPath)
+	defer srv2.Close()
+	second := postJSON(t, srv2.Client(), srv2.URL+"/transfers", payload)
+	secondBody := readJSON(t, second)
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("restart replay status %d body %v", second.StatusCode, secondBody)
+	}
+	if secondBody["id"] != firstBody["id"] {
+		t.Fatalf("id %v vs %v", secondBody["id"], firstBody["id"])
+	}
+	if getBalance(t, srv2, "wallet_1") != 170 || getBalance(t, srv2, "wallet_2") != 30 {
+		t.Fatal("balances moved after restart replay")
 	}
 }
 
