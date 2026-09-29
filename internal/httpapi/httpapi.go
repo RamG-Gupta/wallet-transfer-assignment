@@ -38,10 +38,12 @@ type createWalletBody struct {
 	InitialBalance int64  `json:"initialBalance"`
 }
 
+const maxJSONBody = 1 << 20
+
 func (s *Server) createWallet(w http.ResponseWriter, r *http.Request) {
 	var body createWalletBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 	wallet, err := s.svc.CreateWallet(r.Context(), domain.CreateWalletRequest{
@@ -74,8 +76,8 @@ type createTransferBody struct {
 
 func (s *Server) createTransfer(w http.ResponseWriter, r *http.Request) {
 	var body createTransferBody
-	if err := decodeJSON(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeDecodeError(w, err)
 		return
 	}
 	tr, replay, err := s.svc.CreateTransfer(r.Context(), domain.CreateTransferRequest{
@@ -130,7 +132,8 @@ func transferResponse(tr domain.Transfer) map[string]any {
 	}
 }
 
-func decodeJSON(r *http.Request, dest any) error {
+func decodeJSON(w http.ResponseWriter, r *http.Request, dest any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(dest); err != nil {
@@ -158,6 +161,15 @@ func writeDomainError(w http.ResponseWriter, err error) {
 		slog.Error("internal error", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
 	}
+}
+
+func writeDecodeError(w http.ResponseWriter, err error) {
+	var maxBytes *http.MaxBytesError
+	if errors.As(err, &maxBytes) {
+		writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	writeError(w, http.StatusBadRequest, err.Error())
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {

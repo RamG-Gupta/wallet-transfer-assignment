@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -249,16 +250,27 @@ func TestUnknownWallet(t *testing.T) {
 	srv := newTestServer(t)
 	defer srv.Close()
 	createWallet(t, srv, "wallet_1", 100)
-	res := postJSON(t, srv.Client(), srv.URL+"/transfers", map[string]any{
+	payload := map[string]any{
 		"idempotencyKey": "missing",
 		"fromWalletId":   "wallet_1",
 		"toWalletId":     "nope",
 		"amount":         1,
-	})
+	}
+	res := postJSON(t, srv.Client(), srv.URL+"/transfers", payload)
 	if res.StatusCode != http.StatusNotFound {
 		t.Fatalf("status %d", res.StatusCode)
 	}
 	res.Body.Close()
+
+	createWallet(t, srv, "nope", 0)
+	retry := postJSON(t, srv.Client(), srv.URL+"/transfers", payload)
+	body := readJSON(t, retry)
+	if retry.StatusCode != http.StatusNotFound {
+		t.Fatalf("replay after wallet create should stay 404, got %d %v", retry.StatusCode, body)
+	}
+	if getBalance(t, srv, "wallet_1") != 100 {
+		t.Fatal("sticky 404 must not transfer later")
+	}
 }
 
 func TestConcurrentTransfersDoNotOverdraft(t *testing.T) {
@@ -419,6 +431,20 @@ func TestHealth(t *testing.T) {
 		t.Fatalf("status %d", res.StatusCode)
 	}
 	res.Body.Close()
+}
+
+func TestOversizedJSONBodyIsRejected(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	raw := []byte(`{"id":"` + strings.Repeat("a", 1<<20) + `","initialBalance":1}`)
+	res, err := srv.Client().Post(srv.URL+"/wallets", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := readJSON(t, res)
+	if res.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d body %v", res.StatusCode, body)
+	}
 }
 
 func TestTrailingJSONIsRejected(t *testing.T) {

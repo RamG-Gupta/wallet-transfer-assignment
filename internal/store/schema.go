@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS idempotency_records (
     key TEXT PRIMARY KEY,
     request_hash TEXT NOT NULL,
     transfer_id TEXT REFERENCES transfers(id),
+    error_code TEXT,
+    error_detail TEXT,
     status TEXT NOT NULL CHECK (status IN ('PROCESSING', 'COMPLETED')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL

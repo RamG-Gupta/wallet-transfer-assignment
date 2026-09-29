@@ -114,6 +114,13 @@ func (s *Store) RunTransfer(
 		if existing.RequestHash != requestHash {
 			return domain.Transfer{}, false, fmt.Errorf("%w: idempotencyKey reused with a different request", domain.ErrConflict)
 		}
+		if existing.ErrorCode != "" {
+			if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
+				return domain.Transfer{}, false, err
+			}
+			committed = true
+			return domain.Transfer{}, true, replayTerminal(existing.ErrorCode, existing.ErrorDetail)
+		}
 		if existing.TransferID == "" {
 			return domain.Transfer{}, false, fmt.Errorf("incomplete idempotency record for key %s", claimKey)
 		}
@@ -131,7 +138,24 @@ func (s *Store) RunTransfer(
 
 	tr, err := fn(tx)
 	if err != nil {
-		return domain.Transfer{}, false, err
+		fnErr := err
+		code, detail, ok := terminalError(fnErr)
+		if !ok {
+			return domain.Transfer{}, false, fnErr
+		}
+		if _, err := conn.ExecContext(ctx, `
+			UPDATE idempotency_records
+			SET status = 'COMPLETED', error_code = ?, error_detail = ?, updated_at = ?
+			WHERE key = ?`,
+			code, detail, now.UTC().Format(timeLayout), claimKey,
+		); err != nil {
+			return domain.Transfer{}, false, err
+		}
+		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+			return domain.Transfer{}, false, err
+		}
+		committed = true
+		return domain.Transfer{}, false, fnErr
 	}
 	tr.IdempotencyKey = claimKey
 
@@ -154,6 +178,8 @@ func (s *Store) RunTransfer(
 type idempotencyRow struct {
 	RequestHash string
 	TransferID  string
+	ErrorCode   string
+	ErrorDetail string
 }
 
 type Tx struct {
@@ -163,11 +189,11 @@ type Tx struct {
 
 func (t *Tx) loadIdempotency(key string) (idempotencyRow, error) {
 	var row idempotencyRow
-	var transferID sql.NullString
+	var transferID, errorCode, errorDetail sql.NullString
 	err := t.conn.QueryRowContext(t.ctx, `
-		SELECT request_hash, transfer_id
+		SELECT request_hash, transfer_id, error_code, error_detail
 		FROM idempotency_records WHERE key = ?`, key,
-	).Scan(&row.RequestHash, &transferID)
+	).Scan(&row.RequestHash, &transferID, &errorCode, &errorDetail)
 	if errors.Is(err, sql.ErrNoRows) {
 		return idempotencyRow{}, fmt.Errorf("idempotency key %s not found after conflict", key)
 	}
@@ -176,6 +202,12 @@ func (t *Tx) loadIdempotency(key string) (idempotencyRow, error) {
 	}
 	if transferID.Valid {
 		row.TransferID = transferID.String
+	}
+	if errorCode.Valid {
+		row.ErrorCode = errorCode.String
+	}
+	if errorDetail.Valid {
+		row.ErrorDetail = errorDetail.String
 	}
 	return row, nil
 }
@@ -312,4 +344,20 @@ func isUnique(err error) bool {
 		return false
 	}
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
+func terminalError(err error) (code, detail string, ok bool) {
+	if errors.Is(err, domain.ErrNotFound) {
+		return "NOT_FOUND", err.Error(), true
+	}
+	return "", "", false
+}
+
+func replayTerminal(code, detail string) error {
+	switch code {
+	case "NOT_FOUND":
+		return fmt.Errorf("%s: %w", detail, domain.ErrNotFound)
+	default:
+		return fmt.Errorf("stored idempotent error %s: %s", code, detail)
+	}
 }
