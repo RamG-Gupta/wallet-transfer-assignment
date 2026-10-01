@@ -21,7 +21,7 @@ The service must remain correct under duplicate delivery, client retries, and pr
 | Same key, different payload | `409 Conflict`, no side effects |
 | Concurrent transfers from the same wallet | Serialised per wallet; never overdraft; ledger stays balanced |
 | Invalid input (missing key, amount ≤ 0, same wallet) | `400`, no idempotency row, no transfer |
-| Unknown wallet | `404`, no transfer; the key is stored so a later retry still returns that `404` |
+| Unknown wallet | `404`, no transfer, key is **not** stored (same as validation: the request was never accepted) |
 
 Amounts are integers in the smallest currency unit (for this assignment, whole units as given in the spec). Floating-point JSON amounts are rejected.
 
@@ -86,7 +86,7 @@ Insufficient funds (`422` first time and on replay): same shape with `status: "F
 
 All six steps commit together or not at all. After commit the transfer is never left in `PENDING`. `PENDING` exists so the state machine is explicit inside the transaction; it is not a durable in-flight status.
 
-A failed funding check inserts a `FAILED` transfer and completes the idempotency row in the same transaction, with **no** ledger entries and **no** balance change.
+A failed funding check inserts `PENDING`, then updates the same row to `FAILED` in that transaction, with **no** ledger entries and **no** balance change.
 
 ## Failure modes
 
@@ -104,10 +104,11 @@ There is no out-of-band retry worker. Recovery is client retry plus a single ato
 ## Idempotency behavior
 
 - **Storage:** `idempotency_records.key` is the primary key (`TEXT`).
-- **Fingerprint:** SHA-256 of `fromWalletId|toWalletId|amount`. Stored as `request_hash`.
-- **Detection:** `INSERT` the claim at the start of the transfer transaction. A unique-constraint violation means this key already completed (or is visible after the other transaction committed).
-The service returns a structured `IdempotentFailure` for unknown wallets. The store persists `error_code`/`error_detail` without interpreting domain sentinels. Replay returns the same error message.
+- **Fingerprint:** SHA-256 of `fmt.Sprintf("%q\n%q\n%d", fromWalletId, toWalletId, amount)` (Go-quoted wallet IDs so a newline in an id cannot alias another field). Stored as `request_hash`.
+- **Detection:** the service `INSERT`s the claim at the start of the transfer transaction via the store. A unique-constraint violation means this key already completed (or is visible after the other transaction committed).
+- **Original result:** `transfer_id` on the idempotency row is loaded and returned as JSON. HTTP status follows the original outcome (`200` + `PROCESSED`, or `422` + `FAILED`).
 - **No duplicate side effects:** the unique insert is the first write in the transaction. A second request cannot insert a second transfer for that key.
+- **Unknown wallet / invalid input:** these never complete an idempotency row. The client may reuse the key once the request is actually acceptable.
 
 `PROCESSING` is written in the same uncommitted transaction as the transfer work and is only committed after `COMPLETED` + `transfer_id` are set. Callers never observe a durable `PROCESSING` row.
 
@@ -137,7 +138,7 @@ SQLite is used so `go test` and CI run without Postgres. The model is PostgreSQL
 - `wallets(id PK, balance NOT NULL CHECK >= 0, created_at)`
 - `transfers(id PK, from_wallet_id FK, to_wallet_id FK, amount CHECK > 0, status IN PENDING|PROCESSED|FAILED, failure_reason, created_at, updated_at)`
 - `ledger_entries(id PK, transfer_id FK, wallet_id FK, entry_type IN DEBIT|CREDIT, amount CHECK > 0, created_at)` unique `(transfer_id, entry_type)`
-- `idempotency_records(key PK, request_hash NOT NULL, transfer_id FK NULL, error_code, error_detail, status, created_at, updated_at)` — a completed row has either `transfer_id` or a sticky `error_code` (unknown wallet), not both.
+- `idempotency_records(key PK, request_hash NOT NULL, transfer_id FK NULL, status, created_at, updated_at)`
 
 Indexes: `ledger_entries(wallet_id)`, `ledger_entries(transfer_id)`, `transfers(from_wallet_id)`.
 
@@ -159,7 +160,7 @@ Optimistic locking (`version` column) is valid but turns every conflict into a r
 | `internal/store` | SQL, transactions, constraints |
 | `internal/domain` | entities, statuses, errors |
 
-Handlers do not open transactions. The store does not decide transfer policy (insufficient funds is a service decision after locked balances are read).
+Handlers do not open transactions. The store exposes `WithTx` plus claim/load/complete and row operations; **idempotency policy** (replay vs conflict vs new attempt) lives in the service.
 
 ## Testing strategy
 

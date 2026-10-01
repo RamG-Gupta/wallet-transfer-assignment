@@ -268,22 +268,19 @@ func TestUnknownWallet(t *testing.T) {
 		"amount":         1,
 	}
 	res := postJSON(t, srv.Client(), srv.URL+"/transfers", payload)
-	firstBody := readJSON(t, res)
 	if res.StatusCode != http.StatusNotFound {
-		t.Fatalf("status %d body %v", res.StatusCode, firstBody)
+		t.Fatalf("status %d body %v", res.StatusCode, readJSON(t, res))
 	}
+	res.Body.Close()
 
 	createWallet(t, srv, "nope", 0)
 	retry := postJSON(t, srv.Client(), srv.URL+"/transfers", payload)
-	retryBody := readJSON(t, retry)
-	if retry.StatusCode != http.StatusNotFound {
-		t.Fatalf("replay after wallet create should stay 404, got %d %v", retry.StatusCode, retryBody)
+	body := readJSON(t, retry)
+	if retry.StatusCode != http.StatusCreated {
+		t.Fatalf("404 must not bind the key; after the wallet exists the same key should transfer, got %d %v", retry.StatusCode, body)
 	}
-	if retryBody["error"] != firstBody["error"] {
-		t.Fatalf("replay error body %v want %v", retryBody["error"], firstBody["error"])
-	}
-	if getBalance(t, srv, "wallet_1") != 100 {
-		t.Fatal("sticky 404 must not transfer later")
+	if getBalance(t, srv, "wallet_1") != 99 || getBalance(t, srv, "nope") != 1 {
+		t.Fatal("expected transfer after wallet was created")
 	}
 }
 

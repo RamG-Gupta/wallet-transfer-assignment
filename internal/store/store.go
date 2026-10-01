@@ -71,29 +71,16 @@ func (s *Store) GetWallet(ctx context.Context, id string) (domain.Wallet, error)
 	))
 }
 
-// Attempt is the service-layer result of a claimed transfer.
-// Failure, when set, is persisted as a sticky API error (no transfer row).
-type Attempt struct {
-	Transfer domain.Transfer
-	Failure  *domain.IdempotentFailure
-}
-
-// RunTransfer claims the idempotency key inside BEGIN IMMEDIATE, then runs fn.
-// Replay is true when the key already completed with the same request hash.
-func (s *Store) RunTransfer(
-	ctx context.Context,
-	claimKey, requestHash string,
-	now time.Time,
-	fn func(tx *Tx) (Attempt, error),
-) (domain.Transfer, bool, error) {
+// WithTx runs fn inside a single SQLite BEGIN IMMEDIATE transaction.
+func (s *Store) WithTx(ctx context.Context, fn func(tx *Tx) error) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return domain.Transfer{}, false, err
+		return err
 	}
 	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
-		return domain.Transfer{}, false, err
+		return err
 	}
 	committed := false
 	defer func() {
@@ -102,93 +89,19 @@ func (s *Store) RunTransfer(
 		}
 	}()
 
-	tx := &Tx{ctx: ctx, conn: conn}
-	nowStr := now.UTC().Format(timeLayout)
-
-	_, err = conn.ExecContext(ctx, `
-		INSERT INTO idempotency_records (key, request_hash, transfer_id, status, created_at, updated_at)
-		VALUES (?, ?, NULL, 'PROCESSING', ?, ?)`,
-		claimKey, requestHash, nowStr, nowStr,
-	)
-	if err != nil {
-		if !isUnique(err) {
-			return domain.Transfer{}, false, err
-		}
-		existing, loadErr := tx.loadIdempotency(claimKey)
-		if loadErr != nil {
-			return domain.Transfer{}, false, loadErr
-		}
-		if existing.RequestHash != requestHash {
-			return domain.Transfer{}, false, fmt.Errorf("%w: idempotencyKey reused with a different request", domain.ErrConflict)
-		}
-		if existing.ErrorCode != "" {
-			if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
-				return domain.Transfer{}, false, err
-			}
-			committed = true
-			return domain.Transfer{}, true, &domain.IdempotentFailure{
-				Code:    existing.ErrorCode,
-				Message: existing.ErrorDetail,
-			}
-		}
-		if existing.TransferID == "" {
-			return domain.Transfer{}, false, fmt.Errorf("incomplete idempotency record for key %s", claimKey)
-		}
-		tr, getErr := tx.GetTransfer(existing.TransferID)
-		if getErr != nil {
-			return domain.Transfer{}, false, getErr
-		}
-		tr.IdempotencyKey = claimKey
-		if _, err := conn.ExecContext(ctx, `ROLLBACK`); err != nil {
-			return domain.Transfer{}, false, err
-		}
-		committed = true
-		return tr, true, nil
+	if err := fn(&Tx{ctx: ctx, conn: conn}); err != nil {
+		return err
 	}
-
-	attempt, err := fn(tx)
-	if err != nil {
-		return domain.Transfer{}, false, err
-	}
-	if attempt.Failure != nil {
-		if _, err := conn.ExecContext(ctx, `
-			UPDATE idempotency_records
-			SET status = 'COMPLETED', error_code = ?, error_detail = ?, updated_at = ?
-			WHERE key = ?`,
-			attempt.Failure.Code, attempt.Failure.Message, now.UTC().Format(timeLayout), claimKey,
-		); err != nil {
-			return domain.Transfer{}, false, err
-		}
-		if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-			return domain.Transfer{}, false, err
-		}
-		committed = true
-		return domain.Transfer{}, false, attempt.Failure
-	}
-	tr := attempt.Transfer
-	tr.IdempotencyKey = claimKey
-
-	if _, err := conn.ExecContext(ctx, `
-		UPDATE idempotency_records
-		SET status = 'COMPLETED', transfer_id = ?, updated_at = ?
-		WHERE key = ?`,
-		tr.ID, now.UTC().Format(timeLayout), claimKey,
-	); err != nil {
-		return domain.Transfer{}, false, err
-	}
-
 	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
-		return domain.Transfer{}, false, err
+		return err
 	}
 	committed = true
-	return tr, false, nil
+	return nil
 }
 
-type idempotencyRow struct {
+type IdempotencyRecord struct {
 	RequestHash string
 	TransferID  string
-	ErrorCode   string
-	ErrorDetail string
 }
 
 type Tx struct {
@@ -196,29 +109,49 @@ type Tx struct {
 	conn *sql.Conn
 }
 
-func (t *Tx) loadIdempotency(key string) (idempotencyRow, error) {
-	var row idempotencyRow
-	var transferID, errorCode, errorDetail sql.NullString
+func (t *Tx) ClaimIdempotency(key, requestHash string, now time.Time) (inserted bool, rec IdempotencyRecord, err error) {
+	nowStr := now.UTC().Format(timeLayout)
+	_, err = t.conn.ExecContext(t.ctx, `
+		INSERT INTO idempotency_records (key, request_hash, transfer_id, status, created_at, updated_at)
+		VALUES (?, ?, NULL, 'PROCESSING', ?, ?)`,
+		key, requestHash, nowStr, nowStr,
+	)
+	if err == nil {
+		return true, IdempotencyRecord{RequestHash: requestHash}, nil
+	}
+	if !isUnique(err) {
+		return false, IdempotencyRecord{}, err
+	}
+	rec, err = t.GetIdempotency(key)
+	return false, rec, err
+}
+
+func (t *Tx) GetIdempotency(key string) (IdempotencyRecord, error) {
+	var rec IdempotencyRecord
+	var transferID sql.NullString
 	err := t.conn.QueryRowContext(t.ctx, `
-		SELECT request_hash, transfer_id, error_code, error_detail
-		FROM idempotency_records WHERE key = ?`, key,
-	).Scan(&row.RequestHash, &transferID, &errorCode, &errorDetail)
+		SELECT request_hash, transfer_id FROM idempotency_records WHERE key = ?`, key,
+	).Scan(&rec.RequestHash, &transferID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return idempotencyRow{}, fmt.Errorf("idempotency key %s not found after conflict", key)
+		return IdempotencyRecord{}, fmt.Errorf("idempotency key %s not found after conflict", key)
 	}
 	if err != nil {
-		return idempotencyRow{}, err
+		return IdempotencyRecord{}, err
 	}
 	if transferID.Valid {
-		row.TransferID = transferID.String
+		rec.TransferID = transferID.String
 	}
-	if errorCode.Valid {
-		row.ErrorCode = errorCode.String
-	}
-	if errorDetail.Valid {
-		row.ErrorDetail = errorDetail.String
-	}
-	return row, nil
+	return rec, nil
+}
+
+func (t *Tx) CompleteIdempotency(key, transferID string, now time.Time) error {
+	_, err := t.conn.ExecContext(t.ctx, `
+		UPDATE idempotency_records
+		SET status = 'COMPLETED', transfer_id = ?, updated_at = ?
+		WHERE key = ?`,
+		transferID, now.UTC().Format(timeLayout), key,
+	)
+	return err
 }
 
 func (t *Tx) GetWallet(id string) (domain.Wallet, error) {

@@ -34,39 +34,6 @@ var (
 	ErrWalletExists      = errors.New("wallet already exists")
 )
 
-const IdempotencyNotFound = "NOT_FOUND"
-
-// IdempotentFailure is a terminal API outcome persisted with the idempotency key.
-// The store records Code and Message; it does not interpret domain sentinels.
-type IdempotentFailure struct {
-	Code    string
-	Message string
-}
-
-func (f *IdempotentFailure) Error() string {
-	if f == nil {
-		return ""
-	}
-	return f.Message
-}
-
-func (f *IdempotentFailure) Unwrap() error {
-	if f == nil {
-		return nil
-	}
-	switch f.Code {
-	case IdempotencyNotFound:
-		return ErrNotFound
-	default:
-		return nil
-	}
-}
-
-func WalletNotFound(id string) *IdempotentFailure {
-	msg := fmt.Sprintf("%s: wallet %s", ErrNotFound.Error(), id)
-	return &IdempotentFailure{Code: IdempotencyNotFound, Message: msg}
-}
-
 type Wallet struct {
 	ID        string
 	Balance   int64
